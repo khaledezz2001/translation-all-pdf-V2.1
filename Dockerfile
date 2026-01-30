@@ -17,6 +17,11 @@ COPY requirements.txt /requirements.txt
 RUN pip install --no-cache-dir --no-deps -r /requirements.txt
 
 # -----------------------------------------------------
+# Disable hf_transfer (required for build)
+# -----------------------------------------------------
+ENV HF_HUB_ENABLE_HF_TRANSFER=0
+
+# -----------------------------------------------------
 # Pre-download models (offline)
 # -----------------------------------------------------
 RUN python3 - <<EOF
