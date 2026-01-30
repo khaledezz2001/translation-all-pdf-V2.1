@@ -11,43 +11,10 @@ from transformers import (
 )
 
 # =====================================================
-# CUDA SAFETY (RTX 4090 + RTX 5090)
-# =====================================================
-torch.backends.cuda.enable_flash_sdp(False)
-torch.backends.cuda.enable_mem_efficient_sdp(True)
-torch.backends.cuda.enable_math_sdp(True)
-
-# =====================================================
 # Logging helper
 # =====================================================
 def log(msg):
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
-
-# =====================================================
-# GPU-aware CUDA optimizations (NO logic change)
-# =====================================================
-def enable_cuda_optimizations():
-    if not torch.cuda.is_available():
-        return
-
-    major, minor = torch.cuda.get_device_capability()
-    gpu_name = torch.cuda.get_device_name(0)
-
-    log(f"GPU detected: {gpu_name} (SM {major}.{minor})")
-
-    # RTX 4090 (Ada) and older
-    if major <= 8:
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
-        torch.backends.cudnn.benchmark = True
-        log("TF32 ENABLED (Ada/Ampere)")
-
-    # RTX 5090 (Blackwell)
-    else:
-        torch.backends.cuda.matmul.allow_tf32 = False
-        torch.backends.cudnn.allow_tf32 = False
-        torch.backends.cudnn.benchmark = False
-        log("TF32 DISABLED (Blackwell safe mode)")
 
 # =====================================================
 # Model paths
@@ -78,6 +45,7 @@ DEFAULT_SYSTEM_PROMPT = (
     "- Write in neutral legal English\n\n"
 )
 
+
 # =====================================================
 # Load SUMMARY model (Qwen 2.5 7B)
 # =====================================================
@@ -103,8 +71,13 @@ def load_summary_model():
     )
 
     summary_model.eval()
-    enable_cuda_optimizations()
-
+    
+    # Enable CUDA optimizations for RTX 4090
+    if torch.cuda.is_available():
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cudnn.benchmark = True
+    
     log(f"SUMMARY model loaded on device: {summary_model.device}")
 
 # =====================================================
@@ -129,8 +102,12 @@ def load_translate_model():
     ).to("cuda")
 
     translate_model.eval()
-    enable_cuda_optimizations()
-
+    
+    # Enable CUDA optimizations
+    if torch.cuda.is_available():
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+    
     log("TRANSLATION model loaded")
 
 # =====================================================
@@ -145,79 +122,91 @@ def is_layout_line(line: str) -> bool:
 def translate_text(text: str) -> str:
     lines = text.split("\n")
     out_lines = []
+    
+    # Batch processing
     batch_lines = []
     batch_indices = []
-
+    
     for idx, line in enumerate(lines):
         stripped = line.strip()
 
+        # Skip empty lines
         if not stripped:
             out_lines.append(line)
             continue
 
+        # Skip bullet points
         if re.match(r"^[\u2022•\-\*\u00B7]+$", stripped):
             out_lines.append(line)
             continue
 
+        # Skip lines with too few letters
         if len(re.findall(r"[A-Za-zА-Яа-я]", stripped)) < 2:
             out_lines.append(line)
             continue
 
+        # Skip table separators
         if re.match(r"^\|\s*[-\s_\.]+\|\s*[-\s_\.]+\|\s*$", line):
             out_lines.append(line)
             continue
 
+        # Skip layout lines
         if is_layout_line(line):
             out_lines.append(line)
             continue
 
+        # Handle table rows
         if "|" in line:
             cells = line.split("|")
             new_cells = []
-
+            
             for cell in cells:
                 cell_text = cell.strip()
-
+                
                 if not cell_text or re.match(r"^[-\s_\.]+$", cell_text):
                     new_cells.append(cell)
                     continue
-
+                
                 if len(re.findall(r"[A-Za-zА-Яа-я]", cell_text)) < 2:
                     new_cells.append(cell)
                     continue
-
+                
+                # Translate cell
                 inputs = translate_tokenizer(
                     cell_text,
                     return_tensors="pt",
                     truncation=True,
                     max_length=128
                 ).to(translate_model.device)
-
+                
                 with torch.no_grad():
                     output = translate_model.generate(
                         **inputs,
                         max_new_tokens=128,
                         do_sample=False
                     )
-
+                
                 translated = translate_tokenizer.decode(
                     output[0], skip_special_tokens=True
                 )
                 new_cells.append(f" {translated} ")
-
+            
             out_lines.append("|".join(new_cells))
             continue
 
+        # Normal lines - batch them
         batch_lines.append(line)
         batch_indices.append(len(out_lines))
-        out_lines.append(None)
+        out_lines.append(None)  # Placeholder
 
+    # Process batched lines in chunks
     if batch_lines:
-        chunk_size = 16
+        chunk_size = 16  # Smaller chunks for better quality
+        
         for i in range(0, len(batch_lines), chunk_size):
             chunk = batch_lines[i:i+chunk_size]
             chunk_idx = batch_indices[i:i+chunk_size]
-
+            
             inputs = translate_tokenizer(
                 chunk,
                 return_tensors="pt",
@@ -225,18 +214,18 @@ def translate_text(text: str) -> str:
                 truncation=True,
                 max_length=256
             ).to(translate_model.device)
-
+            
             with torch.no_grad():
                 outputs = translate_model.generate(
                     **inputs,
                     max_new_tokens=256,
                     do_sample=False
                 )
-
+            
             translated = translate_tokenizer.batch_decode(
                 outputs, skip_special_tokens=True
             )
-
+            
             for j, trans in enumerate(translated):
                 out_lines[chunk_idx[j]] = trans
 
@@ -272,12 +261,15 @@ def clean_ocr_noise(text: str) -> str:
 # =====================================================
 def limit_words(text: str, max_words: int) -> str:
     words = text.split()
-    return text if len(words) <= max_words else " ".join(words[:max_words])
+    if len(words) <= max_words:
+        return text
+    return " ".join(words[:max_words])
 
 # =====================================================
-# SUMMARY
+# SUMMARY - FIXED VERSION
 # =====================================================
 def summarize_all_pages(pages, max_words: int, system_prompt: str):
+    # Combine all pages
     full_text = "\n\n".join(
         cleaned
         for p in pages
@@ -289,35 +281,46 @@ def summarize_all_pages(pages, max_words: int, system_prompt: str):
         log("ERROR: No valid text found for summary")
         return ""
 
+    log(f"Full text length: {len(full_text)} chars, {len(full_text.split())} words")
+
+    # Build messages for Qwen
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": full_text}
     ]
-
+    
+    # Use apply_chat_template if available
     try:
         prompt = summary_tokenizer.apply_chat_template(
             messages,
             tokenize=False,
             add_generation_prompt=True
         )
+        log("Using chat template")
     except:
+        # Fallback to manual template
         prompt = (
             f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
             f"<|im_start|>user\n{full_text}<|im_end|>\n"
             f"<|im_start|>assistant\n"
         )
+        log("Using manual template")
+
+    log(f"Prompt length: {len(prompt)} chars")
 
     inputs = summary_tokenizer(
         prompt,
         return_tensors="pt",
         truncation=True,
-        max_length=8192
+        max_length=8192  # Qwen supports long context
     ).to(summary_model.device)
+
+    log(f"Input tokens: {inputs['input_ids'].shape[1]}")
 
     with torch.no_grad():
         output = summary_model.generate(
             **inputs,
-            max_new_tokens=max_words * 3,
+            max_new_tokens=max_words * 3,  # More tokens for safety
             min_new_tokens=max(50, max_words // 2),
             do_sample=False,
             temperature=None,
@@ -327,11 +330,26 @@ def summarize_all_pages(pages, max_words: int, system_prompt: str):
             eos_token_id=summary_tokenizer.eos_token_id
         )
 
-    new_tokens = output[0][inputs["input_ids"].shape[1]:]
-    decoded = summary_tokenizer.decode(new_tokens, skip_special_tokens=True)
-    decoded = re.sub(r"<\|.*?\|>", "", decoded).strip()
+    log(f"Output tokens: {output.shape[1]}")
 
-    return limit_words(decoded, max_words)
+    # Decode only the new tokens
+    new_tokens = output[0][inputs['input_ids'].shape[1]:]
+    decoded = summary_tokenizer.decode(new_tokens, skip_special_tokens=True)
+
+    log(f"Decoded summary length: {len(decoded)} chars, {len(decoded.split())} words")
+
+    # Clean up
+    decoded = decoded.strip()
+    
+    # Remove any remaining special tokens
+    decoded = re.sub(r"<\|.*?\|>", "", decoded).strip()
+    
+    # Limit to max words
+    result = limit_words(decoded, max_words)
+    
+    log(f"Final summary: {len(result)} chars, {len(result.split())} words")
+    
+    return result
 
 # =====================================================
 # RunPod handler
@@ -343,17 +361,35 @@ def handler(event):
         log(f"CUDA device: {torch.cuda.get_device_name(0)}")
 
     input_data = event["input"]
+
     pages = input_data["pages"]
     max_words = int(input_data.get("n_words", 100))
     system_prompt = input_data.get("system_prompt", DEFAULT_SYSTEM_PROMPT)
 
+    log(f"Processing {len(pages)} pages, target: {max_words} words")
+
+    # Load models
     load_translate_model()
     load_summary_model()
 
-    for p in pages:
+    # 1️⃣ Translate pages
+    log("Starting translation...")
+    start = time.time()
+    for i, p in enumerate(pages):
+        log(f"Translating page {i+1}/{len(pages)}")
         p["text"] = translate_text(p["text"])
+    log(f"Translation done in {time.time()-start:.2f}s")
 
+    # 2️⃣ Summarize
+    log(f"Creating summary ({max_words} words)")
+    start = time.time()
     summary = summarize_all_pages(pages, max_words, system_prompt)
+    log(f"Summary done in {time.time()-start:.2f}s")
+
+    if not summary:
+        log("WARNING: Summary is empty!")
+
+    log("Handler finished")
 
     return {
         "summary": summary,
