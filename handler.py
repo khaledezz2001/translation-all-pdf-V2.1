@@ -31,6 +31,9 @@ def setup_gpu_optimizations():
     log(f"GPU: {device_name}")
     log(f"Compute Capability: {compute_capability}")
     
+    # Clear CUDA cache before starting
+    torch.cuda.empty_cache()
+    
     # Enable optimizations for both RTX 4090 (Ada Lovelace) and RTX 5090 (Blackwell)
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
@@ -95,10 +98,16 @@ def load_summary_model():
         torch_dtype=torch.float16,
         device_map="auto",
         local_files_only=True,
-        trust_remote_code=True
+        trust_remote_code=True,
+        low_cpu_mem_usage=True,
+        max_memory={0: "22GB"}  # Reserve memory for both models
     )
 
     summary_model.eval()
+    
+    # Enable gradient checkpointing to save memory during generation
+    if hasattr(summary_model, 'gradient_checkpointing_enable'):
+        summary_model.gradient_checkpointing_enable()
     
     log(f"SUMMARY model loaded on device: {summary_model.device}")
 
@@ -400,6 +409,11 @@ def handler(event):
         log(f"Translating page {i+1}/{len(pages)}")
         p["text"] = translate_text(p["text"])
     log(f"Translation done in {time.time()-start:.2f}s")
+
+    # Clear CUDA cache after translation to free memory for summarization
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        log("CUDA cache cleared after translation")
 
     # 2️⃣ Summarize
     log(f"Creating summary ({max_words} words)")
