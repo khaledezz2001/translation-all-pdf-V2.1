@@ -1,25 +1,23 @@
-FROM runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04
+FROM runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404
 
 ENV DEBIAN_FRONTEND=noninteractive
 
 # -----------------------------------------------------
-# System deps
+# System dependencies
 # -----------------------------------------------------
 RUN apt-get update && \
     apt-get install -y git && \
     rm -rf /var/lib/apt/lists/*
 
 # -----------------------------------------------------
-# IMPORTANT: do NOT reinstall torch
+# Python dependencies
+# IMPORTANT: do NOT install torch
 # -----------------------------------------------------
 COPY requirements.txt /requirements.txt
-
-RUN pip install --no-cache-dir \
-    --no-deps \
-    -r /requirements.txt
+RUN pip install --no-cache-dir --no-deps -r /requirements.txt
 
 # -----------------------------------------------------
-# Pre-download models (offline-safe)
+# Pre-download models (offline)
 # -----------------------------------------------------
 RUN python3 - <<EOF
 from huggingface_hub import snapshot_download
@@ -38,7 +36,7 @@ snapshot_download(
 EOF
 
 # -----------------------------------------------------
-# Hugging Face offline mode
+# Hugging Face offline configuration
 # -----------------------------------------------------
 ENV HF_HOME=/models/hf
 ENV TRANSFORMERS_CACHE=/models/hf
@@ -47,7 +45,7 @@ ENV HF_HUB_OFFLINE=1
 ENV TRANSFORMERS_OFFLINE=1
 
 # -----------------------------------------------------
-# CUDA architecture safety (4090 + 5090)
+# CUDA arch safety (4090 + 5090)
 # -----------------------------------------------------
 ENV TORCH_CUDA_ARCH_LIST="8.9;9.0"
 ENV CUDA_DEVICE_ORDER=PCI_BUS_ID
