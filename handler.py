@@ -351,6 +351,24 @@ def summarize_all_pages(pages, max_words: int, system_prompt: str):
     
     return result
 
+
+def cut_after_repetition(text):
+    # Split into sentences (basic rule: ., !, ? followed by space/newline)
+    sentences = re.split(r'(?<=[.!?])\s+', text)
+
+    seen = set()
+    cleaned = []
+
+    for sentence in sentences:
+        s = sentence.strip()
+        if s in seen:
+            # Stop when a sentence appears again
+            break
+        seen.add(s)
+        cleaned.append(sentence)
+
+    return " ".join(cleaned)
+
 # =====================================================
 # RunPod handler
 # =====================================================
@@ -388,7 +406,8 @@ def handler(event):
 
     if not summary:
         log("WARNING: Summary is empty!")
-
+        
+    summary=cut_after_repetition(summary)
     log("Handler finished")
 
     return {
