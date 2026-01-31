@@ -34,9 +34,6 @@ ENV HF_HUB_CACHE=/models/hf
 ENV HF_HUB_OFFLINE=1
 ENV TRANSFORMERS_OFFLINE=1
 
-# CUDA memory management for better allocation
-ENV PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-
 WORKDIR /app
 COPY handler.py /app/handler.py
 
