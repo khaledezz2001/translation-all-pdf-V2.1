@@ -17,37 +17,6 @@ def log(msg):
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
 # =====================================================
-# GPU Optimization Setup
-# =====================================================
-def setup_gpu_optimizations():
-    """Apply CUDA optimizations for RTX 4090 and RTX 5090"""
-    if not torch.cuda.is_available():
-        log("WARNING: CUDA not available")
-        return
-    
-    device_name = torch.cuda.get_device_name(0)
-    compute_capability = torch.cuda.get_device_capability(0)
-    
-    log(f"GPU: {device_name}")
-    log(f"Compute Capability: {compute_capability}")
-    
-    # Clear CUDA cache before starting
-    torch.cuda.empty_cache()
-    
-    # Enable optimizations for both RTX 4090 (Ada Lovelace) and RTX 5090 (Blackwell)
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
-    torch.backends.cudnn.benchmark = True
-    torch.backends.cudnn.deterministic = False
-    torch.backends.cudnn.enabled = True
-    
-    # Enable Flash Attention and memory-efficient attention
-    torch.backends.cuda.enable_flash_sdp(True)
-    torch.backends.cuda.enable_mem_efficient_sdp(True)
-    
-    log("CUDA optimizations enabled for both RTX 4090 and RTX 5090")
-
-# =====================================================
 # Model paths
 # =====================================================
 SUMMARY_MODEL_PATH = "/models/hf/qwen"
@@ -98,16 +67,16 @@ def load_summary_model():
         torch_dtype=torch.float16,
         device_map="auto",
         local_files_only=True,
-        trust_remote_code=True,
-        low_cpu_mem_usage=True,
-        max_memory={0: "22GB"}  # Reserve memory for both models
+        trust_remote_code=True
     )
 
     summary_model.eval()
     
-    # Enable gradient checkpointing to save memory during generation
-    if hasattr(summary_model, 'gradient_checkpointing_enable'):
-        summary_model.gradient_checkpointing_enable()
+    # Enable CUDA optimizations for RTX 4090
+    if torch.cuda.is_available():
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cudnn.benchmark = True
     
     log(f"SUMMARY model loaded on device: {summary_model.device}")
 
@@ -133,6 +102,11 @@ def load_translate_model():
     ).to("cuda")
 
     translate_model.eval()
+    
+    # Enable CUDA optimizations
+    if torch.cuda.is_available():
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
     
     log("TRANSLATION model loaded")
 
@@ -385,7 +359,6 @@ def handler(event):
     log(f"CUDA available: {torch.cuda.is_available()}")
     if torch.cuda.is_available():
         log(f"CUDA device: {torch.cuda.get_device_name(0)}")
-        log(f"CUDA memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
 
     input_data = event["input"]
 
@@ -394,9 +367,6 @@ def handler(event):
     system_prompt = input_data.get("system_prompt", DEFAULT_SYSTEM_PROMPT)
 
     log(f"Processing {len(pages)} pages, target: {max_words} words")
-
-    # Setup GPU optimizations (works for both RTX 4090 and RTX 5090)
-    setup_gpu_optimizations()
 
     # Load models
     load_translate_model()
@@ -409,11 +379,6 @@ def handler(event):
         log(f"Translating page {i+1}/{len(pages)}")
         p["text"] = translate_text(p["text"])
     log(f"Translation done in {time.time()-start:.2f}s")
-
-    # Clear CUDA cache after translation to free memory for summarization
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        log("CUDA cache cleared after translation")
 
     # 2️⃣ Summarize
     log(f"Creating summary ({max_words} words)")
