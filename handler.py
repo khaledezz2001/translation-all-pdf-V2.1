@@ -320,6 +320,8 @@ def summarize_all_pages(pages, max_words: int, system_prompt: str):
     with torch.no_grad():
         output = summary_model.generate(
             **inputs,
+            max_new_tokens=max_words * 3,  # More tokens for safety
+            min_new_tokens=max(50, max_words // 2),
             do_sample=False,
             temperature=None,
             top_p=None,
