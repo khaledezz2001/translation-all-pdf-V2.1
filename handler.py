@@ -263,7 +263,27 @@ def limit_words(text: str, max_words: int) -> str:
     words = text.split()
     if len(words) <= max_words:
         return text
-    return " ".join(words[:max_words])
+
+    # Take max_words, then try to find the last sentence-ending punctuation
+    truncated = " ".join(words[:max_words])
+
+    # Look for the last sentence boundary (., !, ?)
+    last_period = max(truncated.rfind(". "), truncated.rfind(".\n"))
+    last_excl = truncated.rfind("! ")
+    last_quest = truncated.rfind("? ")
+
+    # Also check if the truncated text ends with a period
+    if truncated.rstrip().endswith("."):
+        return truncated.rstrip()
+
+    best = max(last_period, last_excl, last_quest)
+
+    # If we found a sentence boundary in the last 40% of the text, cut there
+    if best > len(truncated) * 0.6:
+        return truncated[:best + 1].strip()
+
+    # Otherwise just return the truncated text with "..." to indicate continuation
+    return truncated.rstrip()
 
 # =====================================================
 # SUMMARY - FIXED VERSION
@@ -283,10 +303,16 @@ def summarize_all_pages(pages, max_words: int, system_prompt: str):
 
     log(f"Full text length: {len(full_text)} chars, {len(full_text.split())} words")
 
-    # Build messages for Qwen
+    # Build messages for Qwen with word count instruction
+    user_content = (
+        f"Summarize the following document in approximately {max_words} words. "
+        f"Make sure to complete all sentences properly.\n\n"
+        f"DOCUMENT:\n{full_text}"
+    )
+
     messages = [
         {"role": "system", "content": system_prompt},
-        {"role": "user", "content": full_text}
+        {"role": "user", "content": user_content}
     ]
     
     # Use apply_chat_template if available
@@ -301,7 +327,7 @@ def summarize_all_pages(pages, max_words: int, system_prompt: str):
         # Fallback to manual template
         prompt = (
             f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
-            f"<|im_start|>user\n{full_text}<|im_end|>\n"
+            f"<|im_start|>user\n{user_content}<|im_end|>\n"
             f"<|im_start|>assistant\n"
         )
         log("Using manual template")
@@ -320,8 +346,7 @@ def summarize_all_pages(pages, max_words: int, system_prompt: str):
     with torch.no_grad():
         output = summary_model.generate(
             **inputs,
-            max_new_tokens=max_words * 3,  # More tokens for safety
-            min_new_tokens=max(50, max_words // 2),
+            max_new_tokens=min(max_words * 5, 4096),  # Give model plenty of room to finish sentences
             do_sample=False,
             temperature=None,
             top_p=None,
@@ -350,25 +375,6 @@ def summarize_all_pages(pages, max_words: int, system_prompt: str):
     log(f"Final summary: {len(result)} chars, {len(result.split())} words")
     
     return result
-
-
-def cut_after_repetition(text):
-    # Split into sentences (basic rule: ., !, ? followed by space/newline)
-    sentences = re.split(r'(?<=[.!?])\s+', text)
-
-    seen = set()
-    cleaned = []
-
-    for sentence in sentences:
-        s = sentence.strip()
-        if s in seen:
-            # Stop when a sentence appears again
-            break
-        seen.add(s)
-        cleaned.append(sentence)
-
-    return " ".join(cleaned)
-
 # =====================================================
 # RunPod handler
 # =====================================================
@@ -381,7 +387,7 @@ def handler(event):
     input_data = event["input"]
 
     pages = input_data["pages"]
-    max_words = int(input_data.get("n_words", 100))
+    max_words = int(input_data.get("n_words", 500))
     system_prompt = input_data.get("system_prompt", DEFAULT_SYSTEM_PROMPT)
 
     log(f"Processing {len(pages)} pages, target: {max_words} words")
@@ -407,7 +413,6 @@ def handler(event):
     if not summary:
         log("WARNING: Summary is empty!")
         
-    summary=cut_after_repetition(summary)
     log("Handler finished")
 
     return {
