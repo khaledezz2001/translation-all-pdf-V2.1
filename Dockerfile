@@ -5,25 +5,18 @@ ENV DEBIAN_FRONTEND=noninteractive
 # Install git if not present
 RUN apt-get update && apt-get install -y git && rm -rf /var/lib/apt/lists/*
 
+# Remove torchvision/torchaudio (not needed for text)
+RUN pip uninstall -y torchvision torchaudio || true
+
 COPY requirements.txt /requirements.txt
 RUN pip install --no-cache-dir -r /requirements.txt
 
-# Download Qwen 2.5 7B Instruct
+# Download OpenPipe/Qwen3-14B-Instruct
 RUN python3 - <<EOF
 from huggingface_hub import snapshot_download
 snapshot_download(
-    repo_id="Qwen/Qwen2.5-7B-Instruct",
+    repo_id="OpenPipe/Qwen3-14B-Instruct",
     local_dir="/models/hf/qwen",
-    local_dir_use_symlinks=False
-)
-EOF
-
-# Download Marian RU → EN
-RUN python3 - <<EOF
-from huggingface_hub import snapshot_download
-snapshot_download(
-    repo_id="Helsinki-NLP/opus-mt-ru-en",
-    local_dir="/models/hf/marian-ru-en",
     local_dir_use_symlinks=False
 )
 EOF
@@ -33,6 +26,7 @@ ENV TRANSFORMERS_CACHE=/models/hf
 ENV HF_HUB_CACHE=/models/hf
 ENV HF_HUB_OFFLINE=1
 ENV TRANSFORMERS_OFFLINE=1
+ENV VLLM_NO_USAGE_STATS=1
 
 WORKDIR /app
 COPY handler.py /app/handler.py
