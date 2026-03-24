@@ -1,6 +1,6 @@
 import time
 import re
-import torch
+import os
 import runpod
 from vllm import LLM, SamplingParams
 
@@ -192,13 +192,8 @@ def load_model():
     if llm_engine is not None:
         return
 
-    if torch.cuda.is_available():
-        gpu_name = torch.cuda.get_device_name(0)
-        vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
-        log(f"GPU: {gpu_name} ({vram_gb:.1f} GB)")
-    else:
-        log("WARNING: No CUDA GPU detected")
-
+    # IMPORTANT: Do NOT call torch.cuda.* before vLLM init!
+    # It initializes CUDA which forces 'spawn' multiprocessing and crashes.
     log("Loading model with vLLM engine...")
     t0 = time.time()
 
@@ -212,6 +207,14 @@ def load_model():
     )
 
     tokenizer = llm_engine.get_tokenizer()
+
+    # Log GPU info AFTER vLLM has initialized CUDA
+    import torch
+    if torch.cuda.is_available():
+        gpu_name = torch.cuda.get_device_name(0)
+        vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+        log(f"GPU: {gpu_name} ({vram_gb:.1f} GB)")
+
     log(f"vLLM engine ready in {time.time()-t0:.1f}s")
 
 
@@ -383,9 +386,6 @@ def summarize_all_pages(pages, max_words, system_prompt):
 # =====================================================
 def handler(event):
     log("Handler started")
-    log(f"CUDA available: {torch.cuda.is_available()}")
-    if torch.cuda.is_available():
-        log(f"CUDA device: {torch.cuda.get_device_name(0)}")
 
     input_data = event["input"]
     pages = input_data["pages"]
