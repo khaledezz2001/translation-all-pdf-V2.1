@@ -339,7 +339,7 @@ def clean_ocr_noise(text: str) -> str:
         line = raw.strip()
         if not line or is_layout_line(line):
             continue
-        if len(re.findall(r"[A-Za-z]", line)) < 5:
+        if len(re.findall(r"[^\W\d_]", line, re.UNICODE)) < 5:
             continue
         upper = line.upper()
         if upper in seen:
@@ -390,7 +390,7 @@ def translate_text_batch(texts, target_language="English"):
 
     for idx, text in enumerate(texts):
         stripped = (text or "").strip()
-        if not stripped or len(re.findall(r"[A-Za-zА-Яа-я]", stripped)) < 5:
+        if not stripped or len(re.findall(r"[^\W\d_]", stripped, re.UNICODE)) < 5:
             results[idx] = text or ""
             continue
 
@@ -432,7 +432,7 @@ def summarize_all_pages(pages, max_words, system_prompt):
     full_text = "\n\n".join(
         cleaned for p in pages
         if (cleaned := clean_ocr_noise(p["text"]))
-        and len(re.findall(r"[A-Za-z]", cleaned)) > 20
+        and len(re.findall(r"[^\W\d_]", cleaned, re.UNICODE)) > 20
     )
 
     if not full_text.strip():
