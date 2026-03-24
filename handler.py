@@ -1,6 +1,5 @@
 import time
 import re
-import os
 import runpod
 from vllm import LLM, SamplingParams
 
