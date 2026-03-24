@@ -2,35 +2,19 @@ import time
 import re
 import torch
 import runpod
+from vllm import LLM, SamplingParams
 
-from transformers import (
-    AutoTokenizer,
-    AutoModelForCausalLM,
-    MarianTokenizer,
-    MarianMTModel,
-)
-
-# =====================================================
-# Logging helper
-# =====================================================
 def log(msg):
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
-# =====================================================
-# Model paths
-# =====================================================
-SUMMARY_MODEL_PATH = "/models/hf/qwen"
-TRANSLATE_MODEL_PATH = "/models/hf/marian-ru-en"
-
-summary_tokenizer = None
-summary_model = None
-translate_tokenizer = None
-translate_model = None
+MODEL_PATH = "/models/hf/qwen"
+llm_engine = None
+tokenizer = None
 
 # =====================================================
-# Default system prompt
+# System prompts (unchanged)
 # =====================================================
-DEFAULT_SYSTEM_PROMPT = (
+DEFAULT_SUMMARY_PROMPT = (
     "You are a professional legal assistant.\n"
     "Produce a single-paragraph summary of the ENTIRE document in clear English.\n"
     "STRICT RULES:\n"
@@ -45,254 +29,314 @@ DEFAULT_SYSTEM_PROMPT = (
     "- Write in neutral legal English\n\n"
 )
 
+def build_translate_prompt(target_language: str) -> str:
+    prompt = (
+        f"You are a certified professional legal translator.\n"
+        f"Auto-detect the language of the input text and translate it into {target_language}.\n"
+        f"STRICT RULES:\n"
+        f"- Translate ONLY — do NOT summarize, paraphrase, or add commentary\n"
+        f"- Preserve the original meaning, tone, and structure as closely as possible\n"
+        f"- Keep proper nouns, names, dates, and numbers unchanged\n"
+        f"- Preserve paragraph breaks and line structure\n"
+        f"- If a word or phrase is already in {target_language}, keep it as-is\n"
+        f"- Output ONLY the {target_language} translation, nothing else\n"
+        f"- Do NOT include any notes, explanations, or metadata about the translation\n"
+        f"- Do NOT mix languages: every word in the output MUST be in {target_language} "
+        f"(except proper nouns, names, and abbreviations)\n"
+        f"- Do NOT use words from other variants or related languages "
+        f"(e.g. if {target_language} is Spanish, do NOT use Catalan, Portuguese, or Italian words)\n"
+        f"CONSISTENCY RULES (CRITICAL):\n"
+        f"- Every transliterated name MUST be spelled EXACTLY the same way every time it appears\n"
+        f"- Preserve ALL letters in transliterated names — do NOT drop, swap, or shorten syllables\n"
+        f"- Example: if 'Пожитков' → 'Pozhitkov', it must ALWAYS be 'Pozhitkov' (NEVER 'Pogotikov', 'Pozhikov', etc.)\n"
+        f"- Example: if 'Курина' → 'Kurina', it must ALWAYS be 'Kurina' (NEVER 'Kurna')\n"
+        f"- Russian street names: preserve the full genitive form. Example: 'ул. Герасима Курина' → 'calle Gerasima Kurina' (NOT 'calle Gerasim Kurna')\n"
+        f"- Do NOT repeat or duplicate content blocks — translate each section exactly once\n"
+    )
+
+    prompt += (
+        "CYRILLIC TRANSLITERATION RULES (apply ONLY if source text contains Cyrillic script):\n"
+        "- Use phonetic transliteration that matches the Cyrillic spelling letter-by-letter\n"
+        "- Complete mapping: А→A, Б→B, В→V, Г→G, Д→D, Е→E, Ё→Yo, Ж→Zh, З→Z, "
+        "И→I, Й→Y, К→K, Л→L, М→M, Н→N, О→O, П→P, Р→R, С→S, Т→T, "
+        "У→U, Ф→F, Х→Kh, Ц→Ts, Ч→Ch, Ш→Sh, Щ→Shch, Ъ→(omit), Ы→Y, Ь→(omit), Э→E, Ю→Yu, Я→Ya\n"
+        "- 'Кс' in Russian names → 'Ks'. Example: Ксенофонтов → Ksenofontov (NOT Xenofontov)\n"
+        "- BUT if a Cyrillic name is a phonetic rendering of a known foreign name, restore the original spelling. "
+        "Example: КСАВЬЕР → XAVIER (NOT KSAVIER)\n"
+        "- 'Е' → always 'E' (NEVER 'I'). Example: ГРИСЕН → GRISEN (NOT GRISIN)\n"
+        "- 'Ж' → always 'Zh' (NEVER skip it). Example: Пожитков → Pozhitkov (NEVER Pogotikov)\n"
+        "- Company names in Cyrillic are phonetic transcriptions — transliterate them back faithfully\n"
+        "- For foreign place names, streets, and districts written phonetically in Cyrillic, "
+        "ALWAYS restore the official English name — do NOT transliterate.\n"
+        "HONG KONG: Сёнвань → Sheung Wan, Коулун → Kowloon, Цим Ша Цуй → Tsim Sha Tsui, "
+        "Бонэм Стрэнд → Bonham Strand, Ванчай → Wan Chai, Монгкок → Mong Kok, "
+        "Централ → Central, Абердин → Aberdeen, Чайвань → Chai Wan, Куорри Бей → Quarry Bay\n"
+        "UAE: Дубай → Dubai, Абу-Даби → Abu Dhabi, Шарджа → Sharjah, "
+        "Джебел Али → Jebel Ali, Дейра → Deira, Бур Дубай → Bur Dubai, "
+        "Аджман → Ajman, Рас-эль-Хайма → Ras Al Khaimah, Фуджейра → Fujairah\n"
+        "UK: Лондон → London, Вестминстер → Westminster, Кэнэри Уорф → Canary Wharf, "
+        "Эдинбург → Edinburgh, Манчестер → Manchester, Бирмингем → Birmingham\n"
+        "CYPRUS: Никосия → Nicosia, Лимассол → Limassol, Ларнака → Larnaca, Пафос → Paphos\n"
+        "SINGAPORE: Сингапур → Singapore, Раффлз Плейс → Raffles Place\n"
+        "BVI: Тортола → Tortola, Род Таун → Road Town\n"
+        "SEYCHELLES: Маэ → Mahe, Виктория → Victoria, Праслин → Praslin\n"
+        "OTHER: Панама → Panama, Белиз → Belize, Гибралтар → Gibraltar, "
+        "Лихтенштейн → Liechtenstein, Люксембург → Luxembourg, Мальта → Malta, "
+        "Каймановы острова → Cayman Islands, Бермуды → Bermuda\n"
+        "COMMON TERMS: Стрит/Стрэнд → Street/Strand, Билдинг → Building, "
+        "Башня/Тауэр → Tower, Авеню → Avenue, Плаза → Plaza, Роуд → Road\n"
+    )
+
+    prompt += (
+        "RUSSIAN ABBREVIATIONS AND INSTITUTIONS:\n"
+        "- ОВД (Отдел Внутренних Дел) → Departamento de Policía / Police Department (NOT 'Oficina de Investigación de Delitos')\n"
+        "- ЗАГС → Registro Civil / Civil Registry\n"
+        "- ИНН → NIF (Número de Identificación Fiscal) / TIN (Tax Identification Number)\n"
+        "- ОГРН → Número de Registro Estatal / State Registration Number\n"
+    )
+
+    if target_language.lower() in ("spanish", "español", "espanol"):
+        prompt += (
+            "SPANISH LEGAL TERMINOLOGY (MANDATORY — use these exact terms):\n"
+            "PARTIES IN LEASE/RENTAL AGREEMENTS (CRITICAL — be consistent throughout):\n"
+            "- Tenant → Arrendatario (NEVER 'Inquilino' — use 'Arrendatario' EVERYWHERE in the document)\n"
+            "- Landlord (singular) → Arrendador\n"
+            "- Landlords (plural) → Arrendadores\n"
+            "- CRITICAL: If the document uses plural 'Landlords', ALWAYS use 'los Arrendadores' (NEVER 'el Arrendador')\n"
+            "- CRITICAL: Pick ONE term for each party and use it CONSISTENTLY throughout the ENTIRE document. "
+            "Do NOT alternate between 'Inquilino' and 'Arrendatario' — ALWAYS use 'Arrendatario'.\n"
+            "PARTIES IN LOAN AGREEMENTS:\n"
+            "- Lender / Займодавец → Prestamista (NEVER 'Cedente', NEVER 'Acreedor', NEVER 'Creditor')\n"
+            "- Borrower / Заемщик → Prestatario (NEVER 'Deudor')\n"
+            "- Creditor / Кредитор → Acreedor\n"
+            "- Debtor / Должник → Deudor\n"
+            "- Цедент → Cedente (ONLY in cession/assignment agreements)\n"
+            "- Цессионарий → Cesionario (ONLY in cession/assignment agreements)\n"
+            "OTHER LEGAL PARTIES:\n"
+            "- party (legal) → parte (NEVER 'partido')\n"
+            "- parties → partes (NEVER 'partidos')\n"
+            "- trespasser → ocupante ilegal (NEVER 'intruso')\n"
+            "- witnesses → testigos\n"
+            "CONTRACT STRUCTURE TERMS:\n"
+            "- Schedule (contract appendix) → Anexo (NEVER 'Programa')\n"
+            "- Schedule A, Schedule B → Anexo A, Anexo B\n"
+            "- Clause → Cláusula\n"
+            "- Exhibit → Exhibición / Anexo\n"
+            "- Addendum → Adenda\n"
+            "- Amendment → Enmienda\n"
+            "COMPANY TYPES:\n"
+            "- ОАО (Открытое Акционерное Общество) → Sociedad Anónima (S.A.) — NEVER 'Societat Anónima'\n"
+            "- ЗАО (Закрытое Акционерное Общество) → Sociedad Anónima Cerrada\n"
+            "- ООО (Общество с Ограниченной Ответственностью) → Sociedad de Responsabilidad Limitada (S.R.L.) — NEVER 'Sociedad con Limitación'\n"
+            "- Limited / Ltd → Limitada / Ltda.\n"
+            "- АО (Акционерное Общество) → Sociedad Anónima (S.A.)\n"
+            "- ИП (Индивидуальный Предприниматель) → Empresario Individual\n"
+            "- Международная Акционерная Компания → Compañía Internacional Sociedad Anónima — NEVER 'Compañía Internacional de Acciones'\n"
+            "- УК (Управляющая Компания) → Sociedad Gestora / Compañía Gestora\n"
+            "REAL ESTATE AND LEASE TERMS:\n"
+            "- lease → contrato de arrendamiento\n"
+            "- rent → renta / alquiler\n"
+            "- premises → local / instalaciones\n"
+            "- nuisance → molestias / actividades molestas (NEVER leave as 'nuisance' in English)\n"
+            "- shareholding / equity stake → participación accionaria / porcentaje de acciones\n"
+            "- remedies → recursos legales / acciones legales (NEVER 'remedios')\n"
+            "- written notice → notificación escrita\n"
+            "- 'three (3) months notice' → 'con tres (3) meses de antelación' (NEVER 'tres meses antes')\n"
+            "- 'it is hereby agreed as follows' → 'EN CONSECUENCIA, LAS PARTES ACUERDAN LO SIGUIENTE'\n"
+            "- act of God → fuerza mayor (preferred) or acto de fuerza mayor\n"
+            "ARCHITECTURAL AND BUILDING TERMS:\n"
+            "- basement / underground floor → sótano (NEVER 'planta baja subterránea')\n"
+            "- mezzanine / mezzanine floor → entresuelo (NEVER 'plaza media')\n"
+            "- ground floor → planta baja\n"
+            "- floor plan → plano de planta\n"
+            "FINANCIAL AND LEGAL TERMS:\n"
+            "- расчеты / settlements → pagos / liquidaciones (NEVER 'cálculo')\n"
+            "- Договор займа → Contrato de Préstamo\n"
+            "- Договор цессии → Contrato de Cesión\n"
+            "- Устав → Estatutos Sociales\n"
+            "- Доверенность → Poder Notarial\n"
+            "- Протокол → Acta\n"
+            "- Решение → Resolución / Decisión\n"
+            "- по решению / по усмотрению → por decisión de (NEVER 'a discreción')\n"
+            "- месторождения → yacimientos de recursos naturales\n"
+            "- новые области природных ресурсов → nuevas áreas de recursos naturales (NOT just 'yacimientos')\n"
+            "- прошито и пронумеровано → cosido y numerado (NOT 'pegado')\n"
+            "- Наблюдательный совет / Технический комитет → Comité Técnico (NOT 'Comité de Supervisión' unless context is a supervisory board)\n"
+            "GENERAL RULES FOR SPANISH:\n"
+            "- Use standard Castilian Spanish (castellano) — NEVER Catalan, Galician, or other variants\n"
+            "- Use formal legal register: use 'deberá' for obligations, 'por la presente' for declarations\n"
+            "- Use standard Spanish date format: '__ de octubre de 2025'\n"
+            "- Maintain formal legal phrasing: 'representado por su director', 'actuando en virtud de'\n"
+            "- ALL English words MUST be translated — do NOT leave any English terms in the output "
+            "(except proper nouns, company names, and internationally recognized abbreviations)\n"
+            "- If Greek text appears (e.g. architectural labels), add Spanish translation in brackets: e.g. 'ΚΑΤΟΨΗ ΥΠΟΓΕΙΟΥ [PLANO DEL SÓTANO]'\n"
+        )
+
+    prompt += (
+        "LEGAL TRANSLATION STANDARDS:\n"
+        f"- Use formal legal register in {target_language}\n"
+        "- Preserve civil law terminology accurately\n"
+        "- Maintain formal legal phrasing and tone\n"
+        f"- Use standard date format for {target_language}\n"
+        "- Do NOT leave any terms in English unless they are proper nouns or internationally recognized abbreviations\n"
+    )
+
+    return prompt
+
 
 # =====================================================
-# Load SUMMARY model (Qwen 2.5 7B)
+# Load model with vLLM — auto-detects GPU
 # =====================================================
-def load_summary_model():
-    global summary_tokenizer, summary_model
-    if summary_model is not None:
+def load_model():
+    global llm_engine, tokenizer
+    if llm_engine is not None:
         return
 
-    log("Loading SUMMARY model (Qwen-2.5-7B-Instruct, FP16)")
-
-    summary_tokenizer = AutoTokenizer.from_pretrained(
-        SUMMARY_MODEL_PATH,
-        local_files_only=True,
-        trust_remote_code=True
-    )
-
-    summary_model = AutoModelForCausalLM.from_pretrained(
-        SUMMARY_MODEL_PATH,
-        torch_dtype=torch.float16,
-        device_map="auto",
-        local_files_only=True,
-        trust_remote_code=True
-    )
-
-    summary_model.eval()
-    
-    # Enable CUDA optimizations for RTX 4090
     if torch.cuda.is_available():
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
-        torch.backends.cudnn.benchmark = True
-    
-    log(f"SUMMARY model loaded on device: {summary_model.device}")
+        gpu_name = torch.cuda.get_device_name(0)
+        vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+        log(f"GPU: {gpu_name} ({vram_gb:.1f} GB)")
+    else:
+        log("WARNING: No CUDA GPU detected")
 
-# =====================================================
-# Load TRANSLATION model (Marian RU → EN)
-# =====================================================
-def load_translate_model():
-    global translate_tokenizer, translate_model
-    if translate_model is not None:
-        return
+    log("Loading model with vLLM engine...")
+    t0 = time.time()
 
-    log("Loading TRANSLATION model (Marian RU → EN)")
-
-    translate_tokenizer = MarianTokenizer.from_pretrained(
-        TRANSLATE_MODEL_PATH,
-        local_files_only=True
+    llm_engine = LLM(
+        model=MODEL_PATH,
+        dtype="auto",                    # auto-selects BF16 on Ampere+
+        gpu_memory_utilization=0.90,
+        max_model_len=16384,
+        trust_remote_code=True,
+        enable_prefix_caching=True,       # Caches system prompt KV across pages
     )
 
-    translate_model = MarianMTModel.from_pretrained(
-        TRANSLATE_MODEL_PATH,
-        torch_dtype=torch.float16,
-        local_files_only=True
-    ).to("cuda")
+    tokenizer = llm_engine.get_tokenizer()
+    log(f"vLLM engine ready in {time.time()-t0:.1f}s")
 
-    translate_model.eval()
-    
-    # Enable CUDA optimizations
-    if torch.cuda.is_available():
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
-    
-    log("TRANSLATION model loaded")
 
 # =====================================================
-# Detect layout separators
+# Helper: build prompt from messages
+# =====================================================
+def build_prompt(messages):
+    try:
+        return tokenizer.apply_chat_template(
+            messages, tokenize=False,
+            add_generation_prompt=True,
+            enable_thinking=False
+        )
+    except:
+        parts = []
+        for m in messages:
+            parts.append(f"<|im_start|>{m['role']}\n{m['content']}<|im_end|>")
+        parts.append("<|im_start|>assistant\n/nothink\n")
+        return "\n".join(parts)
+
+
+# =====================================================
+# Layout / OCR helpers
 # =====================================================
 def is_layout_line(line: str) -> bool:
     return bool(re.match(r"^[\-\._\s]{5,}$", line))
 
-# =====================================================
-# TRANSLATION - OPTIMIZED WITH BATCHING
-# =====================================================
-def translate_text(text: str) -> str:
-    lines = text.split("\n")
-    out_lines = []
-    
-    # Batch processing
-    batch_lines = []
-    batch_indices = []
-    
-    for idx, line in enumerate(lines):
-        stripped = line.strip()
-
-        # Skip empty lines
-        if not stripped:
-            out_lines.append(line)
-            continue
-
-        # Skip bullet points
-        if re.match(r"^[\u2022•\-\*\u00B7]+$", stripped):
-            out_lines.append(line)
-            continue
-
-        # Skip lines with too few letters
-        if len(re.findall(r"[A-Za-zА-Яа-я]", stripped)) < 2:
-            out_lines.append(line)
-            continue
-
-        # Skip table separators
-        if re.match(r"^\|\s*[-\s_\.]+\|\s*[-\s_\.]+\|\s*$", line):
-            out_lines.append(line)
-            continue
-
-        # Skip layout lines
-        if is_layout_line(line):
-            out_lines.append(line)
-            continue
-
-        # Handle table rows
-        if "|" in line:
-            cells = line.split("|")
-            new_cells = []
-            
-            for cell in cells:
-                cell_text = cell.strip()
-                
-                if not cell_text or re.match(r"^[-\s_\.]+$", cell_text):
-                    new_cells.append(cell)
-                    continue
-                
-                if len(re.findall(r"[A-Za-zА-Яа-я]", cell_text)) < 2:
-                    new_cells.append(cell)
-                    continue
-                
-                # Translate cell
-                inputs = translate_tokenizer(
-                    cell_text,
-                    return_tensors="pt",
-                    truncation=True,
-                    max_length=128
-                ).to(translate_model.device)
-                
-                with torch.no_grad():
-                    output = translate_model.generate(
-                        **inputs,
-                        max_new_tokens=128,
-                        do_sample=False
-                    )
-                
-                translated = translate_tokenizer.decode(
-                    output[0], skip_special_tokens=True
-                )
-                new_cells.append(f" {translated} ")
-            
-            out_lines.append("|".join(new_cells))
-            continue
-
-        # Normal lines - batch them
-        batch_lines.append(line)
-        batch_indices.append(len(out_lines))
-        out_lines.append(None)  # Placeholder
-
-    # Process batched lines in chunks
-    if batch_lines:
-        chunk_size = 16  # Smaller chunks for better quality
-        
-        for i in range(0, len(batch_lines), chunk_size):
-            chunk = batch_lines[i:i+chunk_size]
-            chunk_idx = batch_indices[i:i+chunk_size]
-            
-            inputs = translate_tokenizer(
-                chunk,
-                return_tensors="pt",
-                padding=True,
-                truncation=True,
-                max_length=256
-            ).to(translate_model.device)
-            
-            with torch.no_grad():
-                outputs = translate_model.generate(
-                    **inputs,
-                    max_new_tokens=256,
-                    do_sample=False
-                )
-            
-            translated = translate_tokenizer.batch_decode(
-                outputs, skip_special_tokens=True
-            )
-            
-            for j, trans in enumerate(translated):
-                out_lines[chunk_idx[j]] = trans
-
-    return "\n".join(out_lines)
-
-# =====================================================
-# OCR cleanup
-# =====================================================
 def clean_ocr_noise(text: str) -> str:
-    cleaned = []
-    seen = set()
-
+    cleaned, seen = [], set()
     for raw in text.split("\n"):
         line = raw.strip()
-        upper = line.upper()
-
-        if not line:
-            continue
-        if is_layout_line(line):
+        if not line or is_layout_line(line):
             continue
         if len(re.findall(r"[A-Za-z]", line)) < 5:
             continue
+        upper = line.upper()
         if upper in seen:
             continue
-
         seen.add(upper)
         cleaned.append(line)
-
     return "\n".join(cleaned)
 
-# =====================================================
-# Word limiter
-# =====================================================
 def limit_words(text: str, max_words: int) -> str:
     words = text.split()
     if len(words) <= max_words:
         return text
-
-    # Take max_words, then try to find the last sentence-ending punctuation
     truncated = " ".join(words[:max_words])
-
-    # Look for the last sentence boundary (., !, ?)
+    if truncated.rstrip().endswith("."):
+        return truncated.rstrip()
     last_period = max(truncated.rfind(". "), truncated.rfind(".\n"))
     last_excl = truncated.rfind("! ")
     last_quest = truncated.rfind("? ")
-
-    # Also check if the truncated text ends with a period
-    if truncated.rstrip().endswith("."):
-        return truncated.rstrip()
-
     best = max(last_period, last_excl, last_quest)
-
-    # If we found a sentence boundary in the last 40% of the text, cut there
     if best > len(truncated) * 0.6:
         return truncated[:best + 1].strip()
-
-    # Otherwise just return the truncated text with "..." to indicate continuation
     return truncated.rstrip()
 
+def clean_output(decoded: str) -> str:
+    decoded = re.sub(r"<think>.*?</think>", "", decoded, flags=re.DOTALL).strip()
+    decoded = re.sub(r"<\|.*?\|>", "", decoded).strip()
+    for marker in ["STRICT RULES:", "LEGAL TRANSLATION STANDARDS:"]:
+        if marker in decoded:
+            idx_m = decoded.find(marker)
+            lines = decoded[idx_m:].split("\n")
+            last_rule = 0
+            for i, line in enumerate(lines):
+                if line.strip().startswith("- "):
+                    last_rule = i
+            decoded = "\n".join(lines[last_rule + 1:]).strip()
+    return decoded
+
+
 # =====================================================
-# SUMMARY - FIXED VERSION
+# TRANSLATION — vLLM parallel batch
 # =====================================================
-def summarize_all_pages(pages, max_words: int, system_prompt: str):
-    # Combine all pages
+def translate_text_batch(texts, target_language="English"):
+    translate_prompt = build_translate_prompt(target_language)
+
+    prompts = []
+    valid_indices = []
+    results = [""] * len(texts)
+
+    for idx, text in enumerate(texts):
+        stripped = (text or "").strip()
+        if not stripped or len(re.findall(r"[A-Za-zА-Яа-я]", stripped)) < 5:
+            results[idx] = text or ""
+            continue
+
+        messages = [
+            {"role": "system", "content": translate_prompt},
+            {"role": "user", "content": stripped}
+        ]
+        prompts.append(build_prompt(messages))
+        valid_indices.append(idx)
+
+    if not prompts:
+        return results
+
+    log(f"Translating {len(prompts)} pages in parallel with vLLM...")
+
+    sampling_params = SamplingParams(
+        temperature=0,
+        max_tokens=4096,
+    )
+
+    t0 = time.time()
+    outputs = llm_engine.generate(prompts, sampling_params)
+    gen_time = time.time() - t0
+
+    total_tokens = sum(len(o.outputs[0].token_ids) for o in outputs)
+    log(f"Translation: {total_tokens} tokens in {gen_time:.1f}s "
+        f"({total_tokens/gen_time:.1f} tok/s effective)")
+
+    for i, output in enumerate(outputs):
+        results[valid_indices[i]] = clean_output(output.outputs[0].text)
+
+    return results
+
+
+# =====================================================
+# SUMMARY — vLLM single call
+# =====================================================
+def summarize_all_pages(pages, max_words, system_prompt):
     full_text = "\n\n".join(
-        cleaned
-        for p in pages
+        cleaned for p in pages
         if (cleaned := clean_ocr_noise(p["text"]))
         and len(re.findall(r"[A-Za-z]", cleaned)) > 20
     )
@@ -301,11 +345,12 @@ def summarize_all_pages(pages, max_words: int, system_prompt: str):
         log("ERROR: No valid text found for summary")
         return ""
 
-    log(f"Full text length: {len(full_text)} chars, {len(full_text.split())} words")
+    doc_word_count = len(full_text.split())
+    actual_target = max(50, min(max_words, doc_word_count // 3))
+    log(f"Summary target: {actual_target} words (doc has {doc_word_count} words)")
 
-    # Build messages for Qwen with word count instruction
     user_content = (
-        f"Summarize the following document in approximately {max_words} words. "
+        f"Summarize the following document in approximately {actual_target} words. "
         f"Make sure to complete all sentences properly.\n\n"
         f"DOCUMENT:\n{full_text}"
     )
@@ -314,67 +359,25 @@ def summarize_all_pages(pages, max_words: int, system_prompt: str):
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_content}
     ]
-    
-    # Use apply_chat_template if available
-    try:
-        prompt = summary_tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True
-        )
-        log("Using chat template")
-    except:
-        # Fallback to manual template
-        prompt = (
-            f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
-            f"<|im_start|>user\n{user_content}<|im_end|>\n"
-            f"<|im_start|>assistant\n"
-        )
-        log("Using manual template")
 
-    log(f"Prompt length: {len(prompt)} chars")
+    prompt = build_prompt(messages)
 
-    inputs = summary_tokenizer(
-        prompt,
-        return_tensors="pt",
-        truncation=True,
-        max_length=8192  # Qwen supports long context
-    ).to(summary_model.device)
+    sampling_params = SamplingParams(
+        temperature=0,
+        max_tokens=min(actual_target * 5, 4096),
+    )
 
-    log(f"Input tokens: {inputs['input_ids'].shape[1]}")
+    t0 = time.time()
+    outputs = llm_engine.generate([prompt], sampling_params)
+    gen_time = time.time() - t0
 
-    with torch.no_grad():
-        output = summary_model.generate(
-            **inputs,
-            max_new_tokens=min(max_words * 5, 4096),  # Give model plenty of room to finish sentences
-            do_sample=False,
-            temperature=None,
-            top_p=None,
-            use_cache=True,
-            pad_token_id=summary_tokenizer.pad_token_id,
-            eos_token_id=summary_tokenizer.eos_token_id
-        )
+    decoded = clean_output(outputs[0].outputs[0].text)
+    result = limit_words(decoded, actual_target)
 
-    log(f"Output tokens: {output.shape[1]}")
-
-    # Decode only the new tokens
-    new_tokens = output[0][inputs['input_ids'].shape[1]:]
-    decoded = summary_tokenizer.decode(new_tokens, skip_special_tokens=True)
-
-    log(f"Decoded summary length: {len(decoded)} chars, {len(decoded.split())} words")
-
-    # Clean up
-    decoded = decoded.strip()
-    
-    # Remove any remaining special tokens
-    decoded = re.sub(r"<\|.*?\|>", "", decoded).strip()
-    
-    # Limit to max words
-    result = limit_words(decoded, max_words)
-    
-    log(f"Final summary: {len(result)} chars, {len(result.split())} words")
-    
+    log(f"Summary: {len(result.split())} words in {gen_time:.1f}s")
     return result
+
+
 # =====================================================
 # RunPod handler
 # =====================================================
@@ -385,26 +388,25 @@ def handler(event):
         log(f"CUDA device: {torch.cuda.get_device_name(0)}")
 
     input_data = event["input"]
-
     pages = input_data["pages"]
     max_words = int(input_data.get("n_words", 500))
-    system_prompt = input_data.get("system_prompt", DEFAULT_SYSTEM_PROMPT)
+    system_prompt = input_data.get("system_prompt", DEFAULT_SUMMARY_PROMPT)
+    target_language = input_data.get("target_language", "English")
 
-    log(f"Processing {len(pages)} pages, target: {max_words} words")
+    log(f"Processing {len(pages)} pages, target: {max_words} words, translate to: {target_language}")
 
-    # Load models
-    load_translate_model()
-    load_summary_model()
+    load_model()
 
-    # 1️⃣ Translate pages
-    log("Starting translation...")
+    # 1) Translate all pages in parallel
+    log(f"Starting batch translation to {target_language}...")
     start = time.time()
+    page_texts = [p["text"] for p in pages]
+    translated_texts = translate_text_batch(page_texts, target_language)
     for i, p in enumerate(pages):
-        log(f"Translating page {i+1}/{len(pages)}")
-        p["text"] = translate_text(p["text"])
+        p["text"] = translated_texts[i]
     log(f"Translation done in {time.time()-start:.2f}s")
 
-    # 2️⃣ Summarize
+    # 2) Summarize
     log(f"Creating summary ({max_words} words)")
     start = time.time()
     summary = summarize_all_pages(pages, max_words, system_prompt)
@@ -412,15 +414,8 @@ def handler(event):
 
     if not summary:
         log("WARNING: Summary is empty!")
-        
+
     log("Handler finished")
+    return {"summary": summary, "pages": pages}
 
-    return {
-        "summary": summary,
-        "pages": pages
-    }
-
-# =====================================================
-# Start RunPod serverless
-# =====================================================
 runpod.serverless.start({"handler": handler})
