@@ -534,6 +534,16 @@ def clean_output(decoded: str) -> str:
 
 
 # =====================================================
+# Token limits and helpers for context-aware chunking
+# =====================================================
+MAX_PROMPT_TOKENS = 12000  # Leave headroom below 16384 for generation + template overhead
+
+def _estimate_tokens(text):
+    """Rough token estimate: ~1 token per 3.5 characters for mixed content."""
+    return len(text) // 3
+
+
+# =====================================================
 # TRANSLATION — vLLM parallel batch
 # =====================================================
 def translate_text_batch(texts, target_language="English"):
@@ -553,8 +563,22 @@ def translate_text_batch(texts, target_language="English"):
             {"role": "system", "content": translate_prompt},
             {"role": "user", "content": stripped}
         ]
-        prompts.append(build_prompt(messages))
-        valid_indices.append(idx)
+        prompt = build_prompt(messages)
+
+        # Safety check: if a single page exceeds context, split it
+        if _estimate_tokens(prompt) > MAX_PROMPT_TOKENS:
+            words = stripped.split()
+            mid = len(words) // 2
+            for half in [" ".join(words[:mid]), " ".join(words[mid:])]:
+                half_msgs = [
+                    {"role": "system", "content": translate_prompt},
+                    {"role": "user", "content": half}
+                ]
+                prompts.append(build_prompt(half_msgs))
+                valid_indices.append(idx)  # both halves map to same index
+        else:
+            prompts.append(prompt)
+            valid_indices.append(idx)
 
     if not prompts:
         return results
@@ -575,55 +599,159 @@ def translate_text_batch(texts, target_language="English"):
         f"({total_tokens/gen_time:.1f} tok/s effective)")
 
     for i, output in enumerate(outputs):
-        results[valid_indices[i]] = clean_output(output.outputs[0].text)
+        translated = clean_output(output.outputs[0].text)
+        idx = valid_indices[i]
+        if results[idx]:
+            results[idx] += "\n" + translated  # Concatenate split-page halves
+        else:
+            results[idx] = translated
 
     return results
 
 
 # =====================================================
-# SUMMARY — vLLM single call
+# SUMMARY — chunked to fit context window
 # =====================================================
-def summarize_all_pages(pages, max_words, system_prompt):
-    full_text = "\n\n".join(
-        cleaned for p in pages
-        if (cleaned := clean_ocr_noise(p["text"]))
-        and len(re.findall(r"[^\W\d_]", cleaned, re.UNICODE)) > 20
-    )
 
-    if not full_text.strip():
-        log("ERROR: No valid text found for summary")
-        return ""
-
-    doc_word_count = len(full_text.split())
-    actual_target = max(50, min(max_words, doc_word_count // 3))
-    log(f"Summary target: {actual_target} words (doc has {doc_word_count} words)")
-
+def _build_summary_prompt(text_block, target_words, system_prompt):
+    """Build a summary prompt from a text block and return the formatted string."""
     user_content = (
-        f"Summarize the following document in approximately {actual_target} words. "
+        f"Summarize the following document in approximately {target_words} words. "
         f"Make sure to complete all sentences properly.\n\n"
-        f"DOCUMENT:\n{full_text}"
+        f"DOCUMENT:\n{text_block}"
     )
-
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_content}
     ]
+    return build_prompt(messages)
 
-    prompt = build_prompt(messages)
+def _chunk_pages_by_tokens(cleaned_pages, max_tokens):
+    """Split cleaned page texts into chunks that fit within max_tokens."""
+    chunks = []
+    current_chunk = []
+    current_tokens = 0
+
+    for page_text in cleaned_pages:
+        page_tokens = _estimate_tokens(page_text)
+        # If a single page exceeds the limit, truncate it
+        if page_tokens > max_tokens:
+            if current_chunk:
+                chunks.append("\n\n".join(current_chunk))
+                current_chunk = []
+                current_tokens = 0
+            # Truncate to fit
+            char_limit = max_tokens * 3
+            chunks.append(page_text[:char_limit])
+            continue
+
+        if current_tokens + page_tokens > max_tokens and current_chunk:
+            chunks.append("\n\n".join(current_chunk))
+            current_chunk = []
+            current_tokens = 0
+
+        current_chunk.append(page_text)
+        current_tokens += page_tokens
+
+    if current_chunk:
+        chunks.append("\n\n".join(current_chunk))
+
+    return chunks
+
+def summarize_all_pages(pages, max_words, system_prompt):
+    # Collect and clean all page texts
+    cleaned_pages = []
+    for p in pages:
+        cleaned = clean_ocr_noise(p["text"])
+        if cleaned and len(re.findall(r"[^\W\d_]", cleaned, re.UNICODE)) > 20:
+            cleaned_pages.append(cleaned)
+
+    if not cleaned_pages:
+        log("ERROR: No valid text found for summary")
+        return ""
+
+    full_text = "\n\n".join(cleaned_pages)
+    doc_word_count = len(full_text.split())
+    actual_target = max(50, min(max_words, doc_word_count // 3))
+    log(f"Summary target: {actual_target} words (doc has {doc_word_count} words)")
+
+    # Check if the full text fits in one prompt
+    test_prompt = _build_summary_prompt(full_text, actual_target, system_prompt)
+    prompt_tokens = _estimate_tokens(test_prompt)
+
+    if prompt_tokens <= MAX_PROMPT_TOKENS:
+        # Single-shot: fits in context
+        log("Summary: single-shot (fits in context)")
+        sampling_params = SamplingParams(
+            temperature=0,
+            max_tokens=min(actual_target * 5, 4096),
+        )
+        t0 = time.time()
+        outputs = llm_engine.generate([test_prompt], sampling_params)
+        gen_time = time.time() - t0
+        decoded = clean_output(outputs[0].outputs[0].text)
+        result = limit_words(decoded, actual_target)
+        log(f"Summary: {len(result.split())} words in {gen_time:.1f}s")
+        return result
+
+    # Chunked summarization: split pages into token-safe groups
+    chunks = _chunk_pages_by_tokens(cleaned_pages, MAX_PROMPT_TOKENS)
+    log(f"Summary: document too large, splitting into {len(chunks)} chunks")
+
+    # Phase 1: Summarize each chunk
+    words_per_chunk = max(100, actual_target // len(chunks) + 50)
+    chunk_prompts = []
+    for i, chunk_text in enumerate(chunks):
+        chunk_prompts.append(
+            _build_summary_prompt(chunk_text, words_per_chunk, system_prompt)
+        )
 
     sampling_params = SamplingParams(
+        temperature=0,
+        max_tokens=min(words_per_chunk * 5, 4096),
+    )
+
+    t0 = time.time()
+    chunk_outputs = llm_engine.generate(chunk_prompts, sampling_params)
+    phase1_time = time.time() - t0
+    log(f"Summary phase 1: {len(chunks)} chunks summarized in {phase1_time:.1f}s")
+
+    chunk_summaries = []
+    for output in chunk_outputs:
+        chunk_summaries.append(clean_output(output.outputs[0].text))
+
+    # Phase 2: Combine chunk summaries into final summary
+    combined = "\n\n".join(
+        f"[Part {i+1}]: {s}" for i, s in enumerate(chunk_summaries)
+    )
+
+    combine_user = (
+        f"Below are summaries of different sections of a single document. "
+        f"Combine them into ONE coherent summary of approximately {actual_target} words. "
+        f"Make sure to complete all sentences properly. "
+        f"Do NOT list the parts separately — write a single unified paragraph.\n\n"
+        f"{combined}"
+    )
+    combine_messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": combine_user}
+    ]
+    combine_prompt = build_prompt(combine_messages)
+
+    sampling_params_final = SamplingParams(
         temperature=0,
         max_tokens=min(actual_target * 5, 4096),
     )
 
     t0 = time.time()
-    outputs = llm_engine.generate([prompt], sampling_params)
-    gen_time = time.time() - t0
+    final_outputs = llm_engine.generate([combine_prompt], sampling_params_final)
+    phase2_time = time.time() - t0
 
-    decoded = clean_output(outputs[0].outputs[0].text)
+    decoded = clean_output(final_outputs[0].outputs[0].text)
     result = limit_words(decoded, actual_target)
 
-    log(f"Summary: {len(result.split())} words in {gen_time:.1f}s")
+    log(f"Summary: {len(result.split())} words in {phase1_time + phase2_time:.1f}s total "
+        f"(phase1={phase1_time:.1f}s, phase2={phase2_time:.1f}s)")
     return result
 
 
