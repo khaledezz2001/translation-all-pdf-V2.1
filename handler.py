@@ -11,7 +11,7 @@ llm_engine = None
 tokenizer = None
 
 # =====================================================
-# System prompts (unchanged)
+# System prompts (unch anged)
 # =====================================================
 DEFAULT_SUMMARY_PROMPT = (
     "You are a professional legal assistant.\n"
